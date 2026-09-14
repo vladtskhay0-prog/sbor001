@@ -1,20 +1,21 @@
 FROM node:20-slim
 
-# ffmpeg + ffprobe
+# Установка ffmpeg (включает ffprobe)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
- && rm -rf /var/lib/apt/lists/*
+  && apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY package.json ./
+# Зависимости
+COPY package*.json ./
 RUN npm install --omit=dev
 
-COPY server.js ./
+# Исходники
+COPY . .
 
-# Каталог для готовых клипов (смонтируй сюда Railway Volume, см. README)
-RUN mkdir -p /data
-ENV FILES_DIR=/data
+# Railway передаёт порт через $PORT; сервер уже слушает process.env.PORT
+ENV NODE_ENV=production
+EXPOSE 3000
 
-EXPOSE 8080
 CMD ["node", "server.js"]

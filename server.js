@@ -17,9 +17,6 @@ const DATA_DIR = process.env.DATA_DIR || path.join(os.tmpdir(), 'ffdata');
 const CLIPS_DIR = path.join(DATA_DIR, 'clips');
 fs.mkdirSync(CLIPS_DIR, { recursive: true });
 
-// Публичный базовый URL, по которому отдаются готовые клипы.
-// На Railway задайте переменную окружения PUBLIC_BASE_URL,
-// например: https://sbor001-production.up.railway.app
 function publicBase(req) {
   if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');
   const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
@@ -27,9 +24,7 @@ function publicBase(req) {
   return `${proto}://${host}`;
 }
 
-// Статика: отдаём сгенерированные клипы/превью
 app.use('/files', express.static(CLIPS_DIR, { maxAge: '1h' }));
-
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ---------- helpers ----------
@@ -41,7 +36,6 @@ function downloadToFile(url, destPath) {
       if (redirects > 6) return reject(new Error('too many redirects'));
       const lib = u.startsWith('http://') ? http : https;
       const req = lib.get(u, { headers: { 'User-Agent': 'ffmpeg-scene-service' } }, (res) => {
-        // следуем за редиректами (Google Drive и т.п.)
         if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
           res.resume();
           const next = new URL(res.headers.location, u).toString();
@@ -54,9 +48,7 @@ function downloadToFile(url, destPath) {
         res.pipe(file);
         file.on('finish', () => file.close(() => resolve(destPath)));
       });
-      req.on('error', (e) => {
-        fs.unlink(destPath, () => reject(e));
-      });
+      req.on('error', (e) => { fs.unlink(destPath, () => reject(e)); });
     };
     doGet(url, 0);
   });
@@ -89,8 +81,6 @@ function runFFprobe(input) {
   };
 }
 
-// Детекция границ сцен через ffmpeg scene-фильтр.
-// Возвращает отсортированный массив таймкодов (сек) точек смены сцены.
 function detectSceneCuts(input, threshold) {
   const thr = (threshold === undefined || threshold === null) ? 0.30 : Number(threshold);
   const args = [
@@ -104,38 +94,26 @@ function detectSceneCuts(input, threshold) {
   const cuts = [];
   const re = /pts_time:([0-9]+(\.[0-9]+)?)/g;
   let m;
-  while ((m = re.exec(out)) !== null) {
-    cuts.push(Number(m[1]));
-  }
+  while ((m = re.exec(out)) !== null) cuts.push(Number(m[1]));
   return cuts.sort((a, b) => a - b);
 }
 
-// Строим сегменты 3–7 сек (min..max) на основе точек смены сцены.
-// Если сцен не нашлось — режем всё видео равномерно на куски длиной ~ (min+max)/2.
 function buildSegments(duration, cuts, minLen, maxLen) {
   const min = Math.max(1, Number(minLen) || 3);
   const max = Math.max(min, Number(maxLen) || 7);
   const target = (min + max) / 2;
-
-  // Кандидатные границы: 0, точки сцен, конец
-  const bounds = [0, ...cuts.filter((t) => t > 0 && t < duration), duration]
-    .sort((a, b) => a - b);
-
+  const bounds = [0, ...cuts.filter((t) => t > 0 && t < duration), duration].sort((a, b) => a - b);
   const segs = [];
   for (let i = 0; i < bounds.length - 1; i++) {
-    let start = bounds[i];
+    const start = bounds[i];
     const end = bounds[i + 1];
-    let len = end - start;
-    if (len < min) continue; // слишком короткая сцена — пропускаем
-
-    // Длинную сцену дробим на куски по target, каждый в пределах [min, max]
+    if (end - start < min) continue;
     let cursor = start;
     while (end - cursor >= min) {
       let segLen = Math.min(max, end - cursor);
-      // не оставляем "хвост" короче min
       if ((end - cursor) - segLen > 0 && (end - cursor) - segLen < min) {
-        segLen = end - cursor; // включаем хвост в текущий кусок
-        if (segLen > max) segLen = target; // но не превышаем разумно
+        segLen = end - cursor;
+        if (segLen > max) segLen = target;
       }
       const s = Number(cursor.toFixed(3));
       const e = Number(Math.min(cursor + segLen, end).toFixed(3));
@@ -143,8 +121,6 @@ function buildSegments(duration, cuts, minLen, maxLen) {
       cursor += segLen;
     }
   }
-
-  // Фолбэк: если сцены не дали сегментов — равномерная нарезка всего видео
   if (segs.length === 0 && duration >= min) {
     let cursor = 0;
     while (duration - cursor >= min) {
@@ -158,7 +134,7 @@ function buildSegments(duration, cuts, minLen, maxLen) {
   return segs;
 }
 
-// Вырезаем один фрагмент из исходника в mp4 (h264/aac), быстрый и точный рез
+// Нарезка БЕЗ перекодирования (stream copy) — быстро и без нагрузки на память.
 function cutClip(input, start, dur, outPath) {
   return new Promise((resolve, reject) => {
     const args = [
@@ -166,26 +142,39 @@ function cutClip(input, start, dur, outPath) {
       '-ss', String(start),
       '-i', input,
       '-t', String(dur),
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
-      '-c:a', 'aac', '-b:a', '128k',
+      '-c', 'copy',
+      '-avoid_negative_ts', 'make_zero',
       '-movflags', '+faststart',
       outPath,
     ];
     const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('cut failed: ' + err.slice(-500))));
+    p.on('close', (code) => {
+      if (code === 0) return resolve(outPath);
+      // Фолбэк: если copy не сработал (кодек/границы) — лёгкое перекодирование
+      const args2 = [
+        '-y', '-ss', String(start), '-i', input, '-t', String(dur),
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '1',
+        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outPath,
+      ];
+      const p2 = spawn('ffmpeg', args2, { stdio: ['ignore', 'ignore', 'pipe'] });
+      let err2 = '';
+      p2.stderr.on('data', (d) => { err2 += d.toString(); });
+      p2.on('close', (c2) => c2 === 0 ? resolve(outPath) : reject(new Error('cut failed: ' + err2.slice(-1500))));
+      p2.on('error', reject);
+    });
     p.on('error', reject);
   });
 }
 
-// ЧБ-версия
+// ЧБ-версия: лёгкий пресет, 1 поток — чтобы не убивало по памяти.
 function makeBW(input, outPath) {
   return new Promise((resolve, reject) => {
     const args = [
       '-y', '-i', input,
       '-vf', 'hue=s=0,eq=contrast=1.05',
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '1',
       '-c:a', 'aac', '-b:a', '128k',
       '-movflags', '+faststart',
       outPath,
@@ -193,26 +182,19 @@ function makeBW(input, outPath) {
     const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('bw failed: ' + err.slice(-500))));
+    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('bw failed: ' + err.slice(-1500))));
     p.on('error', reject);
   });
 }
 
-// Превью-картинка (кадр из середины)
+// Превью-кадр (примерно на 1-й секунде)
 function makePreview(input, outPath) {
   return new Promise((resolve, reject) => {
-    const args = [
-      '-y', '-i', input,
-      '-vf', "select='eq(n\\,0)'+scale=640:-1",
-      '-frames:v', '1',
-      outPath,
-    ];
-    // берём кадр примерно на 1-й секунде
-    const args2 = ['-y', '-ss', '1', '-i', input, '-vframes', '1', '-vf', 'scale=640:-1', outPath];
-    const p = spawn('ffmpeg', args2, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const args = ['-y', '-ss', '1', '-i', input, '-vframes', '1', '-vf', 'scale=640:-1', '-threads', '1', outPath];
+    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let err = '';
     p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('preview failed: ' + err.slice(-500))));
+    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('preview failed: ' + err.slice(-1500))));
     p.on('error', reject);
   });
 }
@@ -223,23 +205,18 @@ function tmpFile(ext) {
 
 // ---------- endpoints ----------
 
-// POST /ffprobe { url }
 app.post('/ffprobe', async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url required' });
   const local = tmpFile('.mp4');
   try {
     await downloadToFile(url, local);
-    const info = runFFprobe(local);
-    res.json(info);
+    res.json(runFFprobe(local));
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    fs.unlink(local, () => {});
-  }
+  } finally { fs.unlink(local, () => {}); }
 });
 
-// POST /split-scenes { url, movie_id, min, max, threshold }
 app.post('/split-scenes', async (req, res) => {
   const { url, movie_id, min, max, threshold } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -273,16 +250,12 @@ app.post('/split-scenes', async (req, res) => {
         original_path: `${base}/files/${mid}/${fname}`,
       });
     }
-
     res.json({ movie_id: mid, scene_cuts: cuts.length, scenes });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    fs.unlink(local, () => {});
-  }
+  } finally { fs.unlink(local, () => {}); }
 });
 
-// POST /make-bw-preview { clip_id, original_path }
 app.post('/make-bw-preview', async (req, res) => {
   const { clip_id, original_path } = req.body || {};
   if (!original_path) return res.status(400).json({ error: 'original_path required' });
@@ -290,18 +263,14 @@ app.post('/make-bw-preview', async (req, res) => {
   const local = tmpFile('.mp4');
   try {
     await downloadToFile(original_path, local);
-
     const outDir = path.join(CLIPS_DIR, 'derived');
     fs.mkdirSync(outDir, { recursive: true });
-
     const bwName = `${cid}_bw.mp4`;
     const prevName = `${cid}_preview.jpg`;
     const bwPath = path.join(outDir, bwName);
     const prevPath = path.join(outDir, prevName);
-
     await makeBW(local, bwPath);
     await makePreview(local, prevPath);
-
     const base = publicBase(req);
     res.json({
       clip_id: cid,
@@ -310,9 +279,7 @@ app.post('/make-bw-preview', async (req, res) => {
     });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
-  } finally {
-    fs.unlink(local, () => {});
-  }
+  } finally { fs.unlink(local, () => {}); }
 });
 
 app.listen(PORT, () => {

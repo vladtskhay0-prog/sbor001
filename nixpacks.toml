@@ -1,9 +1,0 @@
-# Устанавливает Node 20 и ffmpeg (вместе с ffprobe) в образ
-[phases.setup]
-nixPkgs = ["nodejs_20", "ffmpeg"]
-
-[phases.install]
-cmds = ["npm ci"]
-
-[start]
-cmd = "node server.js"

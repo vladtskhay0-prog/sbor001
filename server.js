@@ -1,287 +1,142 @@
-'use strict';
+import express from 'express';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import { createWriteStream } from 'node:fs';
+import { pipeline } from 'node:stream/promises';
+import os from 'node:os';
+import path from 'node:path';
+import ffmpegPath from 'ffmpeg-static';
+import ffprobeStatic from 'ffprobe-static';
 
-const express = require('express');
-const { spawn, spawnSync } = require('child_process');
-const fs = require('fs');
-const path = require('path');
-const os = require('os');
-const crypto = require('crypto');
-const https = require('https');
-const http = require('http');
-
+const execFileP = promisify(execFile);
+const ffprobePath = ffprobeStatic.path;
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '10mb' }));
 
-const PORT = process.env.PORT || 8080;
-const DATA_DIR = process.env.DATA_DIR || path.join(os.tmpdir(), 'ffdata');
-const CLIPS_DIR = path.join(DATA_DIR, 'clips');
-fs.mkdirSync(CLIPS_DIR, { recursive: true });
+// --- helpers ---------------------------------------------------------------
 
-function publicBase(req) {
-  if (process.env.PUBLIC_BASE_URL) return process.env.PUBLIC_BASE_URL.replace(/\/+$/, '');
-  const proto = (req.headers['x-forwarded-proto'] || req.protocol || 'https').split(',')[0];
-  const host = req.headers['x-forwarded-host'] || req.headers.host;
-  return `${proto}://${host}`;
+async function downloadToTmp(url) {
+  const file = path.join(os.tmpdir(), `src_${randomUUID()}.mp4`);
+  const res = await fetch(url, { redirect: 'follow' });
+  if (!res.ok) throw new Error(`download failed: ${res.status}`);
+  await pipeline(res.body, createWriteStream(file));
+  return file;
 }
 
-app.use('/files', express.static(CLIPS_DIR, { maxAge: '1h' }));
-app.get('/health', (_req, res) => res.json({ ok: true }));
-
-// ---------- helpers ----------
-
-function downloadToFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(destPath);
-    const doGet = (u, redirects) => {
-      if (redirects > 6) return reject(new Error('too many redirects'));
-      const lib = u.startsWith('http://') ? http : https;
-      const req = lib.get(u, { headers: { 'User-Agent': 'ffmpeg-scene-service' } }, (res) => {
-        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-          res.resume();
-          const next = new URL(res.headers.location, u).toString();
-          return doGet(next, redirects + 1);
-        }
-        if (res.statusCode !== 200) {
-          res.resume();
-          return reject(new Error('download failed, HTTP ' + res.statusCode));
-        }
-        res.pipe(file);
-        file.on('finish', () => file.close(() => resolve(destPath)));
-      });
-      req.on('error', (e) => { fs.unlink(destPath, () => reject(e)); });
-    };
-    doGet(url, 0);
-  });
-}
-
-function runFFprobe(input) {
-  const args = [
+async function ffprobe(file) {
+  const { stdout } = await execFileP(ffprobePath, [
     '-v', 'error',
     '-select_streams', 'v:0',
-    '-show_entries', 'format=duration:stream=width,height,r_frame_rate,duration',
-    '-of', 'json',
-    input,
-  ];
-  const r = spawnSync('ffprobe', args, { encoding: 'utf8', maxBuffer: 1024 * 1024 * 32 });
-  if (r.status !== 0) throw new Error('ffprobe failed: ' + (r.stderr || r.error));
-  const j = JSON.parse(r.stdout || '{}');
-  const stream = (j.streams && j.streams[0]) || {};
-  const format = j.format || {};
-  let fps = 0;
-  if (stream.r_frame_rate && stream.r_frame_rate.includes('/')) {
-    const [a, b] = stream.r_frame_rate.split('/').map(Number);
-    if (b) fps = a / b;
-  }
-  const duration = Number(format.duration || stream.duration || 0);
+    '-show_entries', 'format=duration,size:stream=width,height,r_frame_rate',
+    '-of', 'json', file,
+  ]);
+  const info = JSON.parse(stdout);
+  const s = (info.streams && info.streams[0]) || {};
+  const f = info.format || {};
+  const [n, d] = String(s.r_frame_rate || '0/1').split('/');
+  const fps = d && Number(d) !== 0 ? Number(n) / Number(d) : null;
   return {
-    duration: Number(duration.toFixed(3)),
-    width: Number(stream.width || 0),
-    height: Number(stream.height || 0),
-    fps: Number(fps.toFixed(3)),
+    duration: f.duration ? Number(f.duration) : null,
+    size: f.size ? Number(f.size) : null,
+    width: s.width ?? null,
+    height: s.height ?? null,
+    fps: fps ? Math.round(fps * 100) / 100 : null,
   };
 }
 
-function detectSceneCuts(input, threshold) {
-  const thr = (threshold === undefined || threshold === null) ? 0.30 : Number(threshold);
-  const args = [
-    '-hide_banner',
-    '-i', input,
-    '-filter_complex', `select='gt(scene,${thr})',metadata=print`,
-    '-an', '-f', 'null', '-',
-  ];
-  const r = spawnSync('ffmpeg', args, { encoding: 'utf8', maxBuffer: 1024 * 1024 * 64 });
-  const out = (r.stderr || '') + (r.stdout || '');
-  const cuts = [];
-  const re = /pts_time:([0-9]+(\.[0-9]+)?)/g;
-  let m;
-  while ((m = re.exec(out)) !== null) cuts.push(Number(m[1]));
-  return cuts.sort((a, b) => a - b);
+async function fileToB64(file) {
+  const buf = await fs.readFile(file);
+  return buf.toString('base64');
 }
 
-function buildSegments(duration, cuts, minLen, maxLen) {
-  const min = Math.max(1, Number(minLen) || 3);
-  const max = Math.max(min, Number(maxLen) || 7);
-  const target = (min + max) / 2;
-  const bounds = [0, ...cuts.filter((t) => t > 0 && t < duration), duration].sort((a, b) => a - b);
-  const segs = [];
-  for (let i = 0; i < bounds.length - 1; i++) {
-    const start = bounds[i];
-    const end = bounds[i + 1];
-    if (end - start < min) continue;
-    let cursor = start;
-    while (end - cursor >= min) {
-      let segLen = Math.min(max, end - cursor);
-      if ((end - cursor) - segLen > 0 && (end - cursor) - segLen < min) {
-        segLen = end - cursor;
-        if (segLen > max) segLen = target;
-      }
-      const s = Number(cursor.toFixed(3));
-      const e = Number(Math.min(cursor + segLen, end).toFixed(3));
-      if (e - s >= min) segs.push({ start_time: s, end_time: e, duration: Number((e - s).toFixed(3)) });
-      cursor += segLen;
-    }
-  }
-  if (segs.length === 0 && duration >= min) {
-    let cursor = 0;
-    while (duration - cursor >= min) {
-      const segLen = Math.min(target, duration - cursor);
-      const s = Number(cursor.toFixed(3));
-      const e = Number((cursor + segLen).toFixed(3));
-      segs.push({ start_time: s, end_time: e, duration: Number((e - s).toFixed(3)) });
-      cursor += segLen;
-    }
-  }
-  return segs;
-}
+async function safeUnlink(f) { try { await fs.unlink(f); } catch {} }
 
-// Нарезка БЕЗ перекодирования (stream copy) — быстро и без нагрузки на память.
-function cutClip(input, start, dur, outPath) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-y',
-      '-ss', String(start),
-      '-i', input,
-      '-t', String(dur),
-      '-c', 'copy',
-      '-avoid_negative_ts', 'make_zero',
-      '-movflags', '+faststart',
-      outPath,
-    ];
-    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => {
-      if (code === 0) return resolve(outPath);
-      // Фолбэк: если copy не сработал (кодек/границы) — лёгкое перекодирование
-      const args2 = [
-        '-y', '-ss', String(start), '-i', input, '-t', String(dur),
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '1',
-        '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', outPath,
-      ];
-      const p2 = spawn('ffmpeg', args2, { stdio: ['ignore', 'ignore', 'pipe'] });
-      let err2 = '';
-      p2.stderr.on('data', (d) => { err2 += d.toString(); });
-      p2.on('close', (c2) => c2 === 0 ? resolve(outPath) : reject(new Error('cut failed: ' + err2.slice(-1500))));
-      p2.on('error', reject);
-    });
-    p.on('error', reject);
-  });
-}
+// --- endpoints -------------------------------------------------------------
 
-// ЧБ-версия: лёгкий пресет, 1 поток — чтобы не убивало по памяти.
-function makeBW(input, outPath) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      '-y', '-i', input,
-      '-vf', 'hue=s=0,eq=contrast=1.05',
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-threads', '1',
-      '-c:a', 'aac', '-b:a', '128k',
-      '-movflags', '+faststart',
-      outPath,
-    ];
-    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('bw failed: ' + err.slice(-1500))));
-    p.on('error', reject);
-  });
-}
+app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Превью-кадр (примерно на 1-й секунде)
-function makePreview(input, outPath) {
-  return new Promise((resolve, reject) => {
-    const args = ['-y', '-ss', '1', '-i', input, '-vframes', '1', '-vf', 'scale=640:-1', '-threads', '1', outPath];
-    const p = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let err = '';
-    p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('close', (code) => code === 0 ? resolve(outPath) : reject(new Error('preview failed: ' + err.slice(-1500))));
-    p.on('error', reject);
-  });
-}
-
-function tmpFile(ext) {
-  return path.join(os.tmpdir(), crypto.randomBytes(8).toString('hex') + (ext || ''));
-}
-
-// ---------- endpoints ----------
-
+// 1) Technical params of the source video
 app.post('/ffprobe', async (req, res) => {
   const { url } = req.body || {};
   if (!url) return res.status(400).json({ error: 'url required' });
-  const local = tmpFile('.mp4');
+  let src;
   try {
-    await downloadToFile(url, local);
-    res.json(runFFprobe(local));
+    src = await downloadToTmp(url);
+    const info = await ffprobe(src);
+    res.json(info);
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
-  } finally { fs.unlink(local, () => {}); }
+  } finally {
+    if (src) await safeUnlink(src);
+  }
 });
 
-app.post('/split-scenes', async (req, res) => {
-  const { url, movie_id, min, max, threshold } = req.body || {};
-  if (!url) return res.status(400).json({ error: 'url required' });
-  const mid = movie_id || ('MOV_' + crypto.randomBytes(3).toString('hex'));
-  const local = tmpFile('.mp4');
+// 2) Extract segments by timecodes (color + BW + preview).
+//    Downloads the source ONCE, cuts all segments.
+//    body: { url, segments: [{ clip_id, start, end }, ...] }
+//    resp: { results: [{ clip_id, start, end, duration,
+//                        color_b64, bw_b64, preview_b64 }, ...] }
+app.post('/extract', async (req, res) => {
+  const { url, segments } = req.body || {};
+  if (!url || !Array.isArray(segments) || segments.length === 0) {
+    return res.status(400).json({ error: 'url and segments[] required' });
+  }
+  let src;
+  const tmp = [];
   try {
-    await downloadToFile(url, local);
-    const info = runFFprobe(local);
-    const duration = info.duration || 0;
-    if (!duration) throw new Error('could not read duration');
+    src = await downloadToTmp(url);
+    const results = [];
 
-    const cuts = detectSceneCuts(local, threshold);
-    const segments = buildSegments(duration, cuts, min || 3, max || 7);
-
-    const outDir = path.join(CLIPS_DIR, mid);
-    fs.mkdirSync(outDir, { recursive: true });
-
-    const base = publicBase(req);
-    const scenes = [];
-    let idx = 0;
     for (const seg of segments) {
-      idx++;
-      const fname = `${mid}_scene_${String(idx).padStart(4, '0')}.mp4`;
-      const outPath = path.join(outDir, fname);
-      await cutClip(local, seg.start_time, seg.duration, outPath);
-      scenes.push({
-        index: idx,
-        start_time: seg.start_time,
-        end_time: seg.end_time,
-        duration: seg.duration,
-        original_path: `${base}/files/${mid}/${fname}`,
+      const start = Number(seg.start);
+      const end = Number(seg.end);
+      if (!isFinite(start) || !isFinite(end) || end <= start) continue;
+      const dur = end - start;
+
+      const colorF = path.join(os.tmpdir(), `c_${randomUUID()}.mp4`);
+      const bwF = path.join(os.tmpdir(), `b_${randomUUID()}.mp4`);
+      const prevF = path.join(os.tmpdir(), `p_${randomUUID()}.jpg`);
+      tmp.push(colorF, bwF, prevF);
+
+      // color cut (accurate, re-encoded)
+      await execFileP(ffmpegPath, [
+        '-y', '-ss', String(start), '-i', src, '-t', String(dur),
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-c:a', 'aac', '-movflags', '+faststart', colorF,
+      ]);
+
+      // black & white version
+      await execFileP(ffmpegPath, [
+        '-y', '-i', colorF, '-vf', 'format=gray',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+        '-c:a', 'copy', '-movflags', '+faststart', bwF,
+      ]);
+
+      // preview thumbnail (middle frame of the clip)
+      await execFileP(ffmpegPath, [
+        '-y', '-ss', String(dur / 2), '-i', colorF,
+        '-frames:v', '1', '-q:v', '3', prevF,
+      ]);
+
+      results.push({
+        clip_id: seg.clip_id ?? null,
+        start, end, duration: Math.round(dur * 100) / 100,
+        color_b64: await fileToB64(colorF),
+        bw_b64: await fileToB64(bwF),
+        preview_b64: await fileToB64(prevF),
       });
     }
-    res.json({ movie_id: mid, scene_cuts: cuts.length, scenes });
+
+    res.json({ results });
   } catch (e) {
     res.status(500).json({ error: String(e.message || e) });
-  } finally { fs.unlink(local, () => {}); }
+  } finally {
+    if (src) await safeUnlink(src);
+    for (const f of tmp) await safeUnlink(f);
+  }
 });
 
-app.post('/make-bw-preview', async (req, res) => {
-  const { clip_id, original_path } = req.body || {};
-  if (!original_path) return res.status(400).json({ error: 'original_path required' });
-  const cid = clip_id || ('CLIP_' + crypto.randomBytes(3).toString('hex'));
-  const local = tmpFile('.mp4');
-  try {
-    await downloadToFile(original_path, local);
-    const outDir = path.join(CLIPS_DIR, 'derived');
-    fs.mkdirSync(outDir, { recursive: true });
-    const bwName = `${cid}_bw.mp4`;
-    const prevName = `${cid}_preview.jpg`;
-    const bwPath = path.join(outDir, bwName);
-    const prevPath = path.join(outDir, prevName);
-    await makeBW(local, bwPath);
-    await makePreview(local, prevPath);
-    const base = publicBase(req);
-    res.json({
-      clip_id: cid,
-      bw_path: `${base}/files/derived/${bwName}`,
-      preview_path: `${base}/files/derived/${prevName}`,
-    });
-  } catch (e) {
-    res.status(500).json({ error: String(e.message || e) });
-  } finally { fs.unlink(local, () => {}); }
-});
-
-app.listen(PORT, () => {
-  console.log(`ffmpeg-scene-service listening on :${PORT}, data=${DATA_DIR}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`VPS listening on ${PORT}`));

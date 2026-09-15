@@ -15,17 +15,12 @@ const ffprobePath = ffprobeStatic.path;
 const app = express();
 app.use(express.json({ limit: '10mb' }));
 
-// --- Google Drive (service account) ---------------------------------------
-// ENV: GOOGLE_SERVICE_ACCOUNT_JSON = весь JSON-ключ сервис-аккаунта (одной строкой).
-// В Google Drive расшарьте папку START и 3 целевые папки (color/bw/preview)
-// на e-mail сервис-аккаунта (…@…iam.gserviceaccount.com) с правом "Editor".
 const auth = new google.auth.GoogleAuth({
   credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
   scopes: ['https://www.googleapis.com/auth/drive'],
 });
 const drive = google.drive({ version: 'v3', auth });
 
-// Достаёт Drive fileId из голого id, из ссылки ?id=... или /d/<id>/
 function extractDriveId(input) {
   if (!input) return null;
   const s = String(input);
@@ -36,8 +31,6 @@ function extractDriveId(input) {
 
 async function safeUnlink(f) { try { await fs.unlink(f); } catch {} }
 
-// Надёжное скачивание через Drive API: metadata.size даёт реальный размер,
-// поэтому обрыв ловится даже без Content-Length у публичной ссылки.
 async function downloadFromDrive(fileId) {
   const file = path.join(os.tmpdir(), `src_${randomUUID()}.mp4`);
   const meta = await drive.files.get({ fileId, fields: 'size,name,mimeType' });
@@ -83,7 +76,6 @@ async function ffprobe(file) {
   };
 }
 
-// Гейт декодируемости: реально вытаскиваем кадр у ts — moov-заголовок больше не обманет.
 async function assertDecodableAt(file, ts) {
   await execFileP(ffmpegPath, ['-v', 'error', '-ss', String(ts), '-i', file, '-frames:v', '1', '-f', 'null', '-']);
 }
@@ -97,10 +89,8 @@ async function uploadToDrive(localPath, folderId, name, mimeType) {
   return res.data.id;
 }
 
-// --- endpoints -------------------------------------------------------------
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// body: { url | file_id }   resp: { duration, size, width, height, fps }
 app.post('/ffprobe', async (req, res) => {
   const { url, file_id } = req.body || {};
   const fileId = extractDriveId(file_id || url);
@@ -113,8 +103,6 @@ app.post('/ffprobe', async (req, res) => {
   finally { if (src) await safeUnlink(src); }
 });
 
-// body: { url|file_id, segments:[{clip_id,start,end}], folders:{color,bw,preview} }
-// resp: { results:[{ clip_id,start,end,duration, color_id,bw_id,preview_id }] }
 app.post('/extract', async (req, res) => {
   const { url, file_id, segments, folders } = req.body || {};
   const fileId = extractDriveId(file_id || url);
@@ -128,7 +116,6 @@ app.post('/extract', async (req, res) => {
     const probe = await ffprobe(src);
     if (!probe.duration || !probe.width) throw new Error('source not decodable after download');
 
-    // ключевой гейт: есть ли реальные кадры у самого дальнего нужного таймкода
     const maxEnd = Math.max(...segments.map(s => Number(s.end)).filter(Number.isFinite));
     await assertDecodableAt(src, Math.max(0, Math.min(maxEnd, probe.duration - 0.5)))
       .catch(() => { throw new Error(`source truncated: no frame data near ${maxEnd}s (incomplete download)`); });
@@ -145,16 +132,12 @@ app.post('/extract', async (req, res) => {
       const prevF  = path.join(os.tmpdir(), `p_${randomUUID()}.jpg`);
       tmp.push(colorF, bwF, prevF);
 
-      // color cut (accurate, re-encoded)
       await execFileP(ffmpegPath, ['-y','-ss',String(start),'-i',src,'-t',String(dur),
         '-c:v','libx264','-preset','veryfast','-crf','20','-c:a','aac','-movflags','+faststart',colorF]);
-      // black & white version
       await execFileP(ffmpegPath, ['-y','-i',colorF,'-vf','format=gray',
         '-c:v','libx264','-preset','veryfast','-crf','20','-c:a','copy','-movflags','+faststart',bwF]);
-      // preview thumbnail (middle frame)
       await execFileP(ffmpegPath, ['-y','-ss',String(dur/2),'-i',colorF,'-frames:v','1','-q:v','3',prevF]);
 
-      // upload 3 версий в Drive
       const cid = seg.clip_id || 'clip';
       const color_id   = await uploadToDrive(colorF, folders?.color,   `${cid}_color.mp4`,   'video/mp4');
       const bw_id      = await uploadToDrive(bwF,    folders?.bw,      `${cid}_bw.mp4`,      'video/mp4');

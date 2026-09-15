@@ -6,10 +6,13 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.19.2",
+    "googleapis": "^144.0.0",
     "ffmpeg-static": "^5.2.0",
-    "ffprobe-static": "^3.1.0",
-    "googleapis": "^144.0.0"
+    "ffprobe-static": "^3.1.0"
   }
 }

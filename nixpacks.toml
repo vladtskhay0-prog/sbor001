@@ -1,8 +1,0 @@
-# nixpacks.toml
-# Ставит ffmpeg (вместе с ffprobe) в контейнер Railway
-
-[phases.setup]
-nixPkgs = ["nodejs", "ffmpeg"]
-
-[start]
-cmd = "node server.js"

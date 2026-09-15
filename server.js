@@ -17,12 +17,42 @@ app.use(express.json({ limit: '10mb' }));
 
 // --- helpers ---------------------------------------------------------------
 
-async function downloadToTmp(url) {
+async function safeUnlink(f) { try { await fs.unlink(f); } catch {} }
+
+// Reliable download: validates completeness (Content-Length), rejects HTML
+// stub pages from Google Drive, and retries with backoff on truncation.
+async function downloadToTmp(url, { retries = 4 } = {}) {
   const file = path.join(os.tmpdir(), `src_${randomUUID()}.mp4`);
-  const res = await fetch(url, { redirect: 'follow' });
-  if (!res.ok) throw new Error(`download failed: ${res.status}`);
-  await pipeline(res.body, createWriteStream(file));
-  return file;
+  let lastErr;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(url, { redirect: 'follow' });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('text/html')) {
+        // Drive returned a confirm/quota HTML page instead of the file
+        throw new Error('got HTML instead of video (Drive confirm/quota page)');
+      }
+      const expected = Number(res.headers.get('content-length')) || 0;
+
+      await pipeline(res.body, createWriteStream(file));
+
+      const { size } = await fs.stat(file);
+      if (size < 100 * 1024) throw new Error(`file too small: ${size} bytes`);
+      if (expected && size !== expected) {
+        throw new Error(`truncated: got ${size} of ${expected} bytes`);
+      }
+      return file; // success
+    } catch (e) {
+      lastErr = e;
+      await safeUnlink(file); // never leave a broken file behind
+      if (attempt < retries) {
+        await new Promise(r => setTimeout(r, 1000 * attempt)); // backoff
+      }
+    }
+  }
+  throw new Error(`download failed after ${retries} attempts: ${lastErr?.message || lastErr}`);
 }
 
 async function ffprobe(file) {
@@ -50,8 +80,6 @@ async function fileToB64(file) {
   const buf = await fs.readFile(file);
   return buf.toString('base64');
 }
-
-async function safeUnlink(f) { try { await fs.unlink(f); } catch {} }
 
 // --- endpoints -------------------------------------------------------------
 
@@ -87,12 +115,26 @@ app.post('/extract', async (req, res) => {
   const tmp = [];
   try {
     src = await downloadToTmp(url);
+
+    // Guard: verify the source is actually decodable and long enough
+    // before attempting any cut, so a bad download fails loudly & early.
+    const probe = await ffprobe(src);
+    if (!probe.duration || !probe.width) {
+      throw new Error('source not decodable after download (corrupt/truncated file)');
+    }
+
     const results = [];
 
     for (const seg of segments) {
       const start = Number(seg.start);
       const end = Number(seg.end);
       if (!isFinite(start) || !isFinite(end) || end <= start) continue;
+      // Skip segments that fall outside the real duration of the source
+      if (probe.duration && start >= probe.duration) {
+        throw new Error(
+          `segment ${seg.clip_id ?? ''} start ${start}s beyond duration ${probe.duration}s`
+        );
+      }
       const dur = end - start;
 
       const colorF = path.join(os.tmpdir(), `c_${randomUUID()}.mp4`);

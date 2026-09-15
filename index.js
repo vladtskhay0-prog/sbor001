@@ -133,9 +133,11 @@ app.post('/extract', async (req, res) => {
       tmp.push(colorF, bwF, prevF);
 
       await execFileP(ffmpegPath, ['-y','-ss',String(start),'-i',src,'-t',String(dur),
-        '-c:v','libx264','-preset','veryfast','-crf','20','-c:a','aac','-movflags','+faststart',colorF]);
+        '-threads','1','-c:v','libx264','-preset','ultrafast','-crf','23',
+        '-max_muxing_queue_size','1024','-c:a','aac','-movflags','+faststart',colorF]);
       await execFileP(ffmpegPath, ['-y','-i',colorF,'-vf','format=gray',
-        '-c:v','libx264','-preset','veryfast','-crf','20','-c:a','copy','-movflags','+faststart',bwF]);
+        '-threads','1','-c:v','libx264','-preset','ultrafast','-crf','23',
+        '-max_muxing_queue_size','1024','-c:a','copy','-movflags','+faststart',bwF]);
       await execFileP(ffmpegPath, ['-y','-ss',String(dur/2),'-i',colorF,'-frames:v','1','-q:v','3',prevF]);
 
       const cid = seg.clip_id || 'clip';
@@ -153,4 +155,4 @@ app.post('/extract', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`VPS listening on ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`VPS listening on ${PORT}`));

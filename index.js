@@ -1,8 +1,8 @@
 // VPS FFmpeg service — cuts clips and RETURNS them as base64 (no Google Drive).
-// Endpoints: GET /health, POST /ffprobe, POST /extract
+// Endpoints: GET /health, POST /ffprobe, POST /extract, POST /prepare
 import express from 'express';
 import { spawn } from 'node:child_process';
-import { createWriteStream, promises as fs } from 'node:fs';
+import { createWriteStream, createReadStream, promises as fs } from 'node:fs';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import os from 'node:os';
@@ -13,6 +13,8 @@ import ffprobeStatic from 'ffprobe-static';
 const ffprobePath = ffprobeStatic.path;
 const app = express();
 app.use(express.json({ limit: '50mb' }));
+
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 function run(bin, args) {
   return new Promise((resolve, reject) => {
@@ -37,6 +39,61 @@ async function downloadTo(url, dest) {
 
 async function tmpDir() {
   return fs.mkdtemp(path.join(os.tmpdir(), 'vps-'));
+}
+
+// --- Gemini File API upload (resumable, streamed from disk) ---
+async function geminiUpload(filePath, displayName) {
+  if (!GEMINI_API_KEY) throw new Error('GEMINI_API_KEY is not set');
+  const { size } = await fs.stat(filePath);
+  const mimeType = 'video/mp4';
+
+  // 1) start resumable session
+  const startRes = await fetch(
+    `https://generativelanguage.googleapis.com/upload/v1beta/files?key=${GEMINI_API_KEY}`,
+    {
+      method: 'POST',
+      headers: {
+        'X-Goog-Upload-Protocol': 'resumable',
+        'X-Goog-Upload-Command': 'start',
+        'X-Goog-Upload-Header-Content-Length': String(size),
+        'X-Goog-Upload-Header-Content-Type': mimeType,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ file: { display_name: displayName } }),
+    },
+  );
+  if (!startRes.ok) throw new Error(`gemini start ${startRes.status}: ${await startRes.text()}`);
+  const uploadUrl = startRes.headers.get('x-goog-upload-url');
+  if (!uploadUrl) throw new Error('no x-goog-upload-url header');
+
+  // 2) stream bytes from disk + finalize
+  const uploadRes = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Length': String(size),
+      'X-Goog-Upload-Offset': '0',
+      'X-Goog-Upload-Command': 'upload, finalize',
+    },
+    body: createReadStream(filePath),
+    duplex: 'half', // required for streamed request body in Node fetch
+  });
+  if (!uploadRes.ok) throw new Error(`gemini upload ${uploadRes.status}: ${await uploadRes.text()}`);
+  let { file } = await uploadRes.json();
+  if (!file?.name) throw new Error('gemini upload: no file in response');
+
+  // 3) poll until ACTIVE (Gemini processes video async)
+  const deadline = Date.now() + 10 * 60 * 1000;
+  while (!file.state || file.state === 'PROCESSING') {
+    if (Date.now() > deadline) throw new Error('gemini processing timeout');
+    await new Promise((r) => setTimeout(r, 5000));
+    const g = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/${file.name}?key=${GEMINI_API_KEY}`,
+    );
+    if (!g.ok) throw new Error(`gemini files.get ${g.status}`);
+    file = await g.json();
+  }
+  if (file.state !== 'ACTIVE') throw new Error(`gemini file not ACTIVE: ${file.state}`);
+  return { fileUri: file.uri, name: file.name };
 }
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
@@ -122,6 +179,24 @@ app.post('/extract', async (req, res) => {
     }
 
     res.json({ results });
+  } catch (err) {
+    res.status(500).json({ error: String(err.message || err) });
+  } finally {
+    if (dir) fs.rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
+});
+
+// NEW: download to disk (streamed) -> upload to Gemini File API -> return fileUri
+app.post('/prepare', async (req, res) => {
+  const { url, file_id } = req.body || {};
+  if (!url) return res.status(400).json({ error: 'url required' });
+  let dir;
+  try {
+    dir = await tmpDir();
+    const input = path.join(dir, 'input.mp4');
+    await downloadTo(url, input);
+    const g = await geminiUpload(input, file_id || 'video');
+    res.json({ fileUri: g.fileUri, gemini_name: g.name });
   } catch (err) {
     res.status(500).json({ error: String(err.message || err) });
   } finally {
